@@ -321,6 +321,64 @@ class GetChildPagesInput(BaseModel):
     )
 
 
+class SearchPagesInput(BaseModel):
+    """Input for searching Confluence pages using CQL."""
+    model_config = ConfigDict(
+        str_strip_whitespace=True,
+        validate_assignment=True,
+        extra='forbid'
+    )
+
+    query: str = Field(
+        ...,
+        description="Search query. Can be plain text or CQL expression (e.g., 'title ~ \"Meeting\" AND space = \"TEAM\"')",
+        min_length=1
+    )
+    space_key: Optional[str] = Field(
+        default=None,
+        description="Optional space key to limit search to a specific space"
+    )
+    limit: int = Field(
+        default=25,
+        description="Maximum number of results to return (default: 25, max: 100)",
+        ge=1,
+        le=100
+    )
+    start: int = Field(
+        default=0,
+        description="Starting index for pagination (default: 0)",
+        ge=0
+    )
+
+
+class GetPageInput(BaseModel):
+    """Input for reading a specific Confluence page."""
+    model_config = ConfigDict(
+        str_strip_whitespace=True,
+        validate_assignment=True,
+        extra='forbid'
+    )
+
+    page_id: Optional[str] = Field(
+        default=None,
+        description="ID of the page to read",
+        min_length=1
+    )
+    page_title: Optional[str] = Field(
+        default=None,
+        description="Title of the page to read (alternative to page_id)",
+        min_length=1
+    )
+    space_key: Optional[str] = Field(
+        default=None,
+        description="Space key (required when using page_title)"
+    )
+    include_content: bool = Field(
+        default=True,
+        description="Whether to include the full page content (default: True)"
+    )
+
+
 class SyncUserDirectoryInput(BaseModel):
     """Input for syncing user directory in Confluence."""
     model_config = ConfigDict(
@@ -1443,6 +1501,258 @@ async def sync_user_directory(params: SyncUserDirectoryInput) -> str:
         return json.dumps({
             "success": False,
             "error": f"Unexpected error: {str(e)}"
+        }, indent=2)
+
+
+@mcp.tool(
+    name="confluence_search_pages",
+    annotations={
+        "title": "Search Confluence Pages",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False
+    }
+)
+async def search_pages(params: SearchPagesInput) -> str:
+    """Search Confluence pages using CQL or plain text query.
+
+    This tool searches across Confluence pages using the Confluence Query Language (CQL).
+    You can search by plain text or provide a full CQL expression for advanced filtering.
+
+    Examples of CQL queries:
+    - Plain text: "deployment guide"
+    - Title search: 'title ~ "Meeting Notes"'
+    - Space + text: 'space = "TEAM" AND text ~ "roadmap"'
+    - Recent pages: 'space = "DOCS" AND lastmodified >= "2024-01-01"'
+
+    Args:
+        params (SearchPagesInput): Parameters containing:
+            - query (str): Plain text or CQL query
+            - space_key (Optional[str]): Limit search to a specific space
+            - limit (int): Maximum results to return (default: 25, max: 100)
+            - start (int): Starting index for pagination (default: 0)
+
+    Returns:
+        str: JSON response containing:
+            - success (bool): Whether search succeeded
+            - query (str): The CQL query used
+            - total_count (int): Total number of matching pages
+            - returned_count (int): Number of pages in this response
+            - pages (list): List of page objects with id, title, space, url, excerpt
+    """
+    try:
+        client = get_http_client()
+
+        # Build CQL query
+        # If query doesn't look like CQL (no operators/keywords), treat as full-text search
+        cql_keywords = ["AND", "OR", "NOT", "~", "=", "!=", ">", "<", "IN ", "space ", "title ", "text ", "type ", "ancestor "]
+        is_cql = any(kw in params.query for kw in cql_keywords)
+
+        if is_cql:
+            cql = params.query
+        else:
+            cql = f'text ~ "{params.query}" AND type = page'
+
+        # Optionally restrict to a space
+        if params.space_key and "space" not in cql:
+            cql = f'space = "{params.space_key}" AND ({cql})'
+
+        response = await client.get(
+            "/rest/api/content/search",
+            params={
+                "cql": cql,
+                "limit": params.limit,
+                "start": params.start,
+                "expand": "space,version,history"
+            }
+        )
+        response.raise_for_status()
+
+        data = response.json()
+
+        pages = []
+        for page in data.get("results", []):
+            page_info = {
+                "id": page.get("id"),
+                "title": page.get("title"),
+                "type": page.get("type"),
+                "status": page.get("status")
+            }
+
+            if "_links" in page and "webui" in page["_links"]:
+                page_info["url"] = f"{CONFLUENCE_URL}{page['_links']['webui']}"
+            else:
+                page_info["url"] = f"{CONFLUENCE_URL}/pages/viewpage.action?pageId={page.get('id')}"
+
+            if "space" in page:
+                page_info["space"] = {
+                    "key": page["space"].get("key"),
+                    "name": page["space"].get("name")
+                }
+
+            if "version" in page:
+                page_info["last_modified"] = page["version"].get("when")
+                page_info["last_modified_by"] = page["version"].get("by", {}).get("displayName", "Unknown")
+
+            if "history" in page:
+                page_info["created_date"] = page["history"].get("createdDate")
+                page_info["created_by"] = page["history"].get("createdBy", {}).get("displayName", "Unknown")
+
+            # Excerpt from search result
+            if "excerpt" in page:
+                page_info["excerpt"] = page["excerpt"]
+
+            pages.append(page_info)
+
+        result = {
+            "success": True,
+            "query": cql,
+            "total_count": data.get("totalSize", data.get("size", 0)),
+            "returned_count": len(pages),
+            "start": params.start,
+            "limit": params.limit,
+            "pages": pages
+        }
+
+        if "next" in data.get("_links", {}):
+            result["has_more"] = True
+            result["next_start"] = params.start + params.limit
+        else:
+            result["has_more"] = False
+
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        error_msg = _handle_api_error(e)
+        return json.dumps({
+            "success": False,
+            "error": error_msg
+        }, indent=2)
+
+
+@mcp.tool(
+    name="confluence_get_page",
+    annotations={
+        "title": "Get Confluence Page",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False
+    }
+)
+async def get_page(params: GetPageInput) -> str:
+    """Read the full content of a specific Confluence page.
+
+    This tool retrieves the complete details and content of a single Confluence page.
+    You can identify the page by its ID or by title + space_key combination.
+
+    Args:
+        params (GetPageInput): Parameters containing:
+            - page_id (Optional[str]): ID of the page to read
+            - page_title (Optional[str]): Title of the page (alternative to page_id)
+            - space_key (Optional[str]): Space key (required when using page_title)
+            - include_content (bool): Whether to return full page content (default: True)
+
+    Returns:
+        str: JSON response containing:
+            - success (bool): Whether retrieval succeeded
+            - id (str): Page ID
+            - title (str): Page title
+            - space (dict): Space key and name
+            - url (str): Page URL
+            - version (dict): Version info (number, when, by)
+            - created_date (str): Creation date
+            - created_by (str): Creator display name
+            - content (str): Full page content in HTML/storage format (if include_content=True)
+            - content_length (int): Length of content in characters
+    """
+    try:
+        client = get_http_client()
+
+        # Validate parameters
+        if params.page_id and params.page_title:
+            return json.dumps({
+                "success": False,
+                "error": "Cannot specify both page_id and page_title. Please use only one."
+            }, indent=2)
+
+        if not params.page_id and not params.page_title:
+            return json.dumps({
+                "success": False,
+                "error": "Must specify either page_id or page_title."
+            }, indent=2)
+
+        # Resolve page_title to page_id if needed
+        page_id = params.page_id
+        if params.page_title:
+            if not params.space_key:
+                return json.dumps({
+                    "success": False,
+                    "error": "space_key is required when using page_title"
+                }, indent=2)
+            page_id = await _find_page_by_title(client, params.space_key, params.page_title)
+            if not page_id:
+                return json.dumps({
+                    "success": False,
+                    "error": f"Page with title '{params.page_title}' not found in space '{params.space_key}'"
+                }, indent=2)
+
+        # Build expand parameter
+        expand = "space,version,history"
+        if params.include_content:
+            expand += ",body.storage"
+
+        response = await client.get(
+            f"/rest/api/content/{page_id}",
+            params={"expand": expand}
+        )
+        response.raise_for_status()
+
+        page = response.json()
+
+        result = {
+            "success": True,
+            "id": page.get("id"),
+            "title": page.get("title"),
+            "type": page.get("type"),
+            "status": page.get("status")
+        }
+
+        if "_links" in page and "webui" in page["_links"]:
+            result["url"] = f"{CONFLUENCE_URL}{page['_links']['webui']}"
+        else:
+            result["url"] = f"{CONFLUENCE_URL}/pages/viewpage.action?pageId={page.get('id')}"
+
+        if "space" in page:
+            result["space"] = {
+                "key": page["space"].get("key"),
+                "name": page["space"].get("name")
+            }
+
+        if "version" in page:
+            result["version"] = {
+                "number": page["version"].get("number"),
+                "when": page["version"].get("when"),
+                "by": page["version"].get("by", {}).get("displayName", "Unknown")
+            }
+
+        if "history" in page:
+            result["created_date"] = page["history"].get("createdDate")
+            result["created_by"] = page["history"].get("createdBy", {}).get("displayName", "Unknown")
+
+        if params.include_content and "body" in page and "storage" in page["body"]:
+            content = page["body"]["storage"].get("value", "")
+            result["content"] = content
+            result["content_length"] = len(content)
+
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        error_msg = _handle_api_error(e)
+        return json.dumps({
+            "success": False,
+            "error": error_msg
         }, indent=2)
 
 

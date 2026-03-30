@@ -7,6 +7,8 @@ MCP (Model Context Protocol) server for Confluence Data Center / Server. Enables
 - Create Confluence pages with HTML or plain text content
 - Add read/edit restrictions to pages (users and groups)
 - Get and remove page restrictions
+- Search pages using CQL or plain text across all spaces
+- Read full content of a specific page
 - List pages in a space with filtering
 - Get child pages of a parent page
 - Sync user directory with external directory (e.g., Active Directory)
@@ -31,6 +33,18 @@ List all pages in a space with optional title filtering.
 ### `confluence_get_child_pages`
 Get all child pages of a specific parent page.
 
+### `confluence_search_pages`
+Search pages across all spaces (or a specific space) using plain text or CQL (Confluence Query Language).
+
+Supports plain text queries as well as full CQL expressions:
+- `"deployment guide"` — full-text search
+- `title ~ "Meeting Notes"` — search in titles
+- `space = "TEAM" AND text ~ "roadmap"` — CQL with space filter
+- `space = "DOCS" AND lastmodified >= "2024-01-01"` — date filtering
+
+### `confluence_get_page`
+Read the full content and metadata of a specific page. Can be identified by `page_id` or by `page_title` + `space_key`. Set `include_content=false` to retrieve only metadata without the full HTML body.
+
 ### `confluence_sync_user_directory`
 Trigger synchronization of user directory with external directory (requires admin privileges).
 
@@ -44,6 +58,9 @@ Once configured, you can use natural language commands with Claude:
 - "Add edit restrictions to page ID 12345 for group 'developers'"
 - "Add view and edit restrictions to page IT-DEV for group 'developers' in TEAM space"
 - "Search all pages in space TEAM and list only pages without restrictions"
+- "Search for pages about 'deployment guide' across all spaces"
+- "Find all pages with 'Meeting' in the title in TEAM space"
+- "Read the content of page titled 'Architecture Overview' in DOCS space"
 - "List all pages in the DOCS space"
 - "Sync the Confluence user directory"
 
