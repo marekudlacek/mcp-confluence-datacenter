@@ -7,17 +7,31 @@ It provides tools for:
 - Adding read/edit restrictions for users and groups
 - Managing page permissions
 - Searching and listing pages in a space
+- Managing comments and labels
+- Deleting pages
 
 Requirements:
-- CONFLUENCE_URL: Your Confluence Cloud URL (e.g., https://your-domain.atlassian.net)
-- CONFLUENCE_LOGIN: Your Confluence user email
-- CONFLUENCE_API_TOKEN: Your Confluence API token
+- CONFLUENCE_URL: Your Confluence DC URL (e.g., https://confluence.your-domain.com)
+- CONFLUENCE_LOGIN: Your Confluence username
+- CONFLUENCE_API_TOKEN: Your Confluence personal access token
 """
 
 import os
 import json
 import re
 import httpx
+try:
+    import html2text as _html2text_module
+    _HTML2TEXT_AVAILABLE = True
+except ImportError:
+    _HTML2TEXT_AVAILABLE = False
+
+try:
+    import markdown as _markdown_module
+    _MARKDOWN_AVAILABLE = True
+except ImportError:
+    _MARKDOWN_AVAILABLE = False
+
 from typing import Optional, List, Literal
 from enum import Enum
 from pydantic import BaseModel, Field, field_validator, ConfigDict
@@ -130,6 +144,10 @@ class CreatePageInput(BaseModel):
     editor_version: EditorVersion = Field(
         default=EditorVersion.V2,
         description="Editor version to use: 'v1' for old editor, 'v2' for new editor (default)"
+    )
+    content_format: Literal["storage", "markdown", "wiki"] = Field(
+        default="storage",
+        description="Input format of content: 'storage' (raw HTML, default), 'markdown', or 'wiki'"
     )
 
     @field_validator('parent_title')
@@ -377,6 +395,10 @@ class GetPageInput(BaseModel):
         default=True,
         description="Whether to include the full page content (default: True)"
     )
+    convert_to_markdown: bool = Field(
+        default=True,
+        description="Convert page content from HTML/storage to Markdown (default: True). Set to False to get raw HTML."
+    )
 
 
 class SyncUserDirectoryInput(BaseModel):
@@ -399,6 +421,101 @@ class SyncUserDirectoryInput(BaseModel):
         default=None,
         description="Admin password for Confluence. If not provided, uses CONFLUENCE_LOGIN_PASSWORD env variable."
     )
+
+
+class UpdatePageInput(BaseModel):
+    """Input for updating a Confluence page (title and/or content)."""
+    model_config = ConfigDict(
+        str_strip_whitespace=True,
+        validate_assignment=True,
+        extra='forbid'
+    )
+
+    page_id: Optional[str] = Field(
+        default=None,
+        description="ID of the page to update",
+        min_length=1
+    )
+    page_title: Optional[str] = Field(
+        default=None,
+        description="Current title of the page to update (alternative to page_id)",
+        min_length=1
+    )
+    space_key: Optional[str] = Field(
+        default=None,
+        description="Space key (required when using page_title)",
+        min_length=1
+    )
+    new_title: Optional[str] = Field(
+        default=None,
+        description="New title for the page. If not provided, the title stays unchanged.",
+        min_length=1,
+        max_length=255
+    )
+    new_content: Optional[str] = Field(
+        default=None,
+        description="New content for the page. If not provided, the content stays unchanged.",
+        min_length=1
+    )
+    content_format: Literal["storage", "markdown", "wiki"] = Field(
+        default="storage",
+        description="Input format of new_content: 'storage' (raw HTML, default), 'markdown', or 'wiki'"
+    )
+    version_message: Optional[str] = Field(
+        default=None,
+        description="Optional version comment describing the change",
+        max_length=500
+    )
+
+
+class DeletePageInput(BaseModel):
+    """Input for deleting a Confluence page."""
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra='forbid')
+
+    page_id: Optional[str] = Field(default=None, description="ID of the page to delete", min_length=1)
+    page_title: Optional[str] = Field(default=None, description="Title of the page to delete (alternative to page_id)", min_length=1)
+    space_key: Optional[str] = Field(default=None, description="Space key (required when using page_title)", min_length=1)
+
+
+class GetCommentsInput(BaseModel):
+    """Input for getting comments on a Confluence page."""
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra='forbid')
+
+    page_id: str = Field(..., description="ID of the page to get comments for", min_length=1)
+    limit: int = Field(default=25, description="Maximum number of comments to return (max: 50)", ge=1, le=50)
+    convert_to_markdown: bool = Field(default=True, description="Convert comment body from HTML to Markdown (default: True)")
+
+
+class AddCommentInput(BaseModel):
+    """Input for adding a comment to a Confluence page."""
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra='forbid')
+
+    page_id: str = Field(..., description="ID of the page to comment on", min_length=1)
+    content: str = Field(..., description="Comment text in Markdown format", min_length=1)
+
+
+class GetLabelsInput(BaseModel):
+    """Input for getting labels on a Confluence page."""
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra='forbid')
+
+    page_id: str = Field(..., description="ID of the page to get labels for", min_length=1)
+
+
+class AddLabelInput(BaseModel):
+    """Input for adding a label to a Confluence page."""
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra='forbid')
+
+    page_id: str = Field(..., description="ID of the page to add a label to", min_length=1)
+    name: str = Field(..., description="Label name (lowercase, spaces replaced with hyphens)", min_length=1, max_length=255)
+
+
+class SearchUserInput(BaseModel):
+    """Input for searching Confluence users."""
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra='forbid')
+
+    query: str = Field(..., description="Search query — plain text (e.g. 'Jan Novak') or CQL expression", min_length=1)
+    group_name: Optional[str] = Field(default=None, description="Optional group name to search members within (DC fallback)")
+    limit: int = Field(default=10, description="Maximum number of results to return", ge=1, le=50)
 
 
 async def _find_page_by_title(client: httpx.AsyncClient, space_key: str, title: str) -> Optional[str]:
@@ -488,11 +605,42 @@ async def _find_user_by_identifier(client: httpx.AsyncClient, identifier: str) -
         return None
 
 
-def _prepare_content_html(content: str) -> str:
+def _html_to_markdown(html: str) -> str:
+    """Convert HTML/storage content to Markdown."""
+    if not html:
+        return ""
+    if _HTML2TEXT_AVAILABLE:
+        h = _html2text_module.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = False
+        h.body_width = 0
+        return h.handle(html).strip()
+    # Fallback: strip HTML tags
+    return re.sub(r'<[^>]+>', '', html).strip()
+
+
+def _markdown_to_storage(md: str) -> str:
+    """Convert Markdown to Confluence storage (HTML) format."""
+    if not md:
+        return ""
+    if _MARKDOWN_AVAILABLE:
+        return _markdown_module.markdown(
+            md,
+            extensions=["tables", "fenced_code", "nl2br"]
+        )
+    # Fallback: wrap as plain text paragraphs
+    return "".join(f"<p>{line}</p>" for line in md.split("\n") if line.strip())
+
+
+def _prepare_content_html(content: str, content_format: str = "storage") -> str:
     """Prepare content for Confluence storage format."""
-    # Simple heuristic: if content doesn't contain HTML tags, wrap in <p>
+    if content_format == "markdown":
+        return _markdown_to_storage(content)
+    if content_format == "wiki":
+        # Wiki markup passed through as-is (server-side rendering handles it)
+        return content
+    # storage / auto-detect
     if not any(tag in content.lower() for tag in ['<p>', '<h1>', '<h2>', '<h3>', '<div>', '<table>']):
-        # Plain text - wrap in paragraph tags
         return f"<p>{content}</p>"
     return content
 
@@ -551,7 +699,7 @@ async def create_page(params: CreatePageInput) -> str:
                 }, indent=2)
 
         # Prepare content
-        html_content = _prepare_content_html(params.content)
+        html_content = _prepare_content_html(params.content, params.content_format)
 
         # Build request payload
         payload: dict = {
@@ -598,6 +746,162 @@ async def create_page(params: CreatePageInput) -> str:
             "title": params.title,
             "space_key": params.space_key,
             "message": f"Page '{params.title}' created successfully"
+        }
+
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        error_msg = _handle_api_error(e)
+        return json.dumps({
+            "success": False,
+            "error": error_msg
+        }, indent=2)
+
+
+@mcp.tool(
+    name="confluence_update_page",
+    annotations={
+        "title": "Update Confluence Page",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True
+    }
+)
+async def update_page(params: UpdatePageInput) -> str:
+    """Update an existing Confluence page's title and/or content.
+
+    This tool updates an existing page. You can rename the page by providing
+    new_title, replace its content by providing new_content, or do both at once.
+    The page can be identified either by page_id or by page_title + space_key.
+
+    The Confluence REST API requires the full page payload (title, type, body,
+    incremented version) for any update, so the current values are fetched first
+    and any field you don't override is preserved as-is.
+
+    Args:
+        params (UpdatePageInput): Update parameters containing:
+            - page_id (Optional[str]): ID of the page to update
+            - page_title (Optional[str]): Current title (alternative to page_id)
+            - space_key (Optional[str]): Space key (required when using page_title)
+            - new_title (Optional[str]): New title (if renaming)
+            - new_content (Optional[str]): New content (if changing body)
+            - version_message (Optional[str]): Optional change comment
+
+    Returns:
+        str: JSON response containing:
+            - success (bool): Whether the update succeeded
+            - page_id (str): Page ID
+            - page_url (str): URL to view the page
+            - old_title (str): Title before the update
+            - new_title (str): Title after the update
+            - title_changed (bool): Whether the title was changed
+            - content_changed (bool): Whether the content was changed
+            - new_version (int): New version number
+            - space_key (str): Space key
+    """
+    try:
+        client = get_http_client()
+
+        # Validate page parameters
+        if params.page_id and params.page_title:
+            return json.dumps({
+                "success": False,
+                "error": "Cannot specify both page_id and page_title. Please use only one."
+            }, indent=2)
+
+        if not params.page_id and not params.page_title:
+            return json.dumps({
+                "success": False,
+                "error": "Must specify either page_id or page_title."
+            }, indent=2)
+
+        # Must update at least something
+        if not params.new_title and not params.new_content:
+            return json.dumps({
+                "success": False,
+                "error": "Must specify at least one of new_title or new_content."
+            }, indent=2)
+
+        # Resolve page_title -> page_id
+        page_id = params.page_id
+        if params.page_title:
+            if not params.space_key:
+                return json.dumps({
+                    "success": False,
+                    "error": "space_key is required when using page_title"
+                }, indent=2)
+            page_id = await _find_page_by_title(client, params.space_key, params.page_title)
+            if not page_id:
+                return json.dumps({
+                    "success": False,
+                    "error": f"Page with title '{params.page_title}' not found in space '{params.space_key}'"
+                }, indent=2)
+
+        # Fetch current page state (version, space, and body if we are not replacing it)
+        expand_parts = ["version", "space"]
+        if not params.new_content:
+            expand_parts.append("body.storage")
+
+        current_resp = await client.get(
+            f"/rest/api/content/{page_id}",
+            params={"expand": ",".join(expand_parts)}
+        )
+        current_resp.raise_for_status()
+        current_page = current_resp.json()
+
+        current_version = current_page.get("version", {}).get("number", 1)
+        current_title = current_page.get("title", "")
+        space_key = current_page.get("space", {}).get("key", "")
+
+        # Decide final values
+        final_title = params.new_title if params.new_title else current_title
+
+        if params.new_content:
+            final_content = _prepare_content_html(params.new_content, params.content_format)
+        else:
+            final_content = current_page.get("body", {}).get("storage", {}).get("value", "")
+
+        # Build update payload
+        payload: dict = {
+            "version": {
+                "number": current_version + 1
+            },
+            "title": final_title,
+            "type": "page",
+            "body": {
+                "storage": {
+                    "value": final_content,
+                    "representation": "storage"
+                }
+            }
+        }
+
+        if params.version_message:
+            payload["version"]["message"] = params.version_message
+
+        # Send update request
+        response = await client.put(
+            f"/rest/api/content/{page_id}",
+            json=payload
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        updated_page_id = data.get("id", page_id)
+        page_url = f"{CONFLUENCE_URL}/pages/viewpage.action?pageId={updated_page_id}"
+
+        result = {
+            "success": True,
+            "page_id": updated_page_id,
+            "page_url": page_url,
+            "old_title": current_title,
+            "new_title": final_title,
+            "title_changed": current_title != final_title,
+            "content_changed": params.new_content is not None,
+            "new_version": data.get("version", {}).get("number", current_version + 1),
+            "space_key": space_key,
+            "message": f"Page '{final_title}' updated successfully"
         }
 
         return json.dumps(result, indent=2)
@@ -1742,7 +2046,13 @@ async def get_page(params: GetPageInput) -> str:
             result["created_by"] = page["history"].get("createdBy", {}).get("displayName", "Unknown")
 
         if params.include_content and "body" in page and "storage" in page["body"]:
-            content = page["body"]["storage"].get("value", "")
+            raw_content = page["body"]["storage"].get("value", "")
+            if params.convert_to_markdown:
+                content = _html_to_markdown(raw_content)
+                result["content_format"] = "markdown"
+            else:
+                content = raw_content
+                result["content_format"] = "storage"
             result["content"] = content
             result["content_length"] = len(content)
 
@@ -1754,6 +2064,383 @@ async def get_page(params: GetPageInput) -> str:
             "success": False,
             "error": error_msg
         }, indent=2)
+
+
+@mcp.tool(
+    name="confluence_delete_page",
+    annotations={
+        "title": "Delete Confluence Page",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True
+    }
+)
+async def delete_page(params: DeletePageInput) -> str:
+    """Move a Confluence page to trash (soft delete).
+
+    The page is moved to the Confluence trash and can be restored by an admin.
+    This uses the standard REST API DELETE endpoint which performs a soft delete
+    on both Confluence DC and Cloud.
+
+    Args:
+        params (DeletePageInput): Parameters containing:
+            - page_id (Optional[str]): ID of the page to delete
+            - page_title (Optional[str]): Title of the page (alternative to page_id)
+            - space_key (Optional[str]): Space key (required when using page_title)
+
+    Returns:
+        str: JSON response containing:
+            - success (bool): Whether deletion succeeded
+            - page_id (str): ID of the deleted page
+            - message (str): Status message
+    """
+    try:
+        client = get_http_client()
+
+        if params.page_id and params.page_title:
+            return json.dumps({"success": False, "error": "Cannot specify both page_id and page_title."}, indent=2)
+        if not params.page_id and not params.page_title:
+            return json.dumps({"success": False, "error": "Must specify either page_id or page_title."}, indent=2)
+
+        page_id = params.page_id
+        if params.page_title:
+            if not params.space_key:
+                return json.dumps({"success": False, "error": "space_key is required when using page_title"}, indent=2)
+            page_id = await _find_page_by_title(client, params.space_key, params.page_title)
+            if not page_id:
+                return json.dumps({"success": False, "error": f"Page '{params.page_title}' not found in space '{params.space_key}'"}, indent=2)
+
+        response = await client.delete(f"/rest/api/content/{page_id}")
+
+        if response.status_code in [200, 204]:
+            return json.dumps({"success": True, "page_id": page_id, "message": "Page moved to trash."}, indent=2)
+        response.raise_for_status()
+        return json.dumps({"success": True, "page_id": page_id, "message": "Page moved to trash."}, indent=2)
+
+    except Exception as e:
+        return json.dumps({"success": False, "error": _handle_api_error(e)}, indent=2)
+
+
+@mcp.tool(
+    name="confluence_get_comments",
+    annotations={
+        "title": "Get Page Comments",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False
+    }
+)
+async def get_comments(params: GetCommentsInput) -> str:
+    """Get footer comments for a Confluence page.
+
+    Retrieves all footer (inline comments are not supported by the DC REST API)
+    comments for a page. Comment bodies are optionally converted to Markdown.
+
+    Args:
+        params (GetCommentsInput): Parameters containing:
+            - page_id (str): ID of the page
+            - limit (int): Max comments to return (default: 25, max: 50)
+            - convert_to_markdown (bool): Convert body HTML to Markdown (default: True)
+
+    Returns:
+        str: JSON response containing:
+            - page_id (str): Page ID
+            - count (int): Number of comments returned
+            - comments (list): List of {id, author, body, created}
+    """
+    try:
+        client = get_http_client()
+
+        response = await client.get(
+            f"/rest/api/content/{params.page_id}/child/comment",
+            params={
+                "expand": "body.storage,version,history",
+                "limit": params.limit
+            }
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        comments = []
+        for item in data.get("results", []):
+            body_html = item.get("body", {}).get("storage", {}).get("value", "")
+            body = _html_to_markdown(body_html) if params.convert_to_markdown else body_html
+
+            author = (
+                item.get("history", {}).get("createdBy", {}).get("displayName")
+                or item.get("version", {}).get("by", {}).get("displayName", "Unknown")
+            )
+            created = (
+                item.get("history", {}).get("createdDate")
+                or item.get("version", {}).get("when", "")
+            )
+
+            comments.append({
+                "id": item.get("id"),
+                "author": author,
+                "body": body,
+                "created": created
+            })
+
+        return json.dumps({
+            "success": True,
+            "page_id": params.page_id,
+            "count": len(comments),
+            "comments": comments
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"success": False, "error": _handle_api_error(e)}, indent=2)
+
+
+@mcp.tool(
+    name="confluence_add_comment",
+    annotations={
+        "title": "Add Page Comment",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True
+    }
+)
+async def add_comment(params: AddCommentInput) -> str:
+    """Add a footer comment to a Confluence page.
+
+    Accepts Markdown input and automatically converts it to Confluence storage
+    format before posting. The comment will appear in the footer comments section.
+
+    Args:
+        params (AddCommentInput): Parameters containing:
+            - page_id (str): ID of the page to comment on
+            - content (str): Comment text in Markdown format
+
+    Returns:
+        str: JSON response containing:
+            - success (bool): Whether the comment was added
+            - comment_id (str): ID of the created comment
+            - page_id (str): Page ID
+            - created_at (str): Creation timestamp
+    """
+    try:
+        client = get_http_client()
+
+        storage_body = _markdown_to_storage(params.content)
+
+        payload = {
+            "type": "comment",
+            "container": {"id": params.page_id, "type": "page"},
+            "body": {
+                "storage": {
+                    "value": storage_body,
+                    "representation": "storage"
+                }
+            }
+        }
+
+        response = await client.post("/rest/api/content", json=payload)
+        response.raise_for_status()
+        data = response.json()
+
+        return json.dumps({
+            "success": True,
+            "comment_id": data.get("id"),
+            "page_id": params.page_id,
+            "created_at": data.get("version", {}).get("when", ""),
+            "message": "Comment added successfully"
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"success": False, "error": _handle_api_error(e)}, indent=2)
+
+
+@mcp.tool(
+    name="confluence_get_labels",
+    annotations={
+        "title": "Get Page Labels",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False
+    }
+)
+async def get_labels(params: GetLabelsInput) -> str:
+    """Get all labels assigned to a Confluence page.
+
+    Args:
+        params (GetLabelsInput): Parameters containing:
+            - page_id (str): ID of the page
+
+    Returns:
+        str: JSON response containing:
+            - page_id (str): Page ID
+            - count (int): Number of labels
+            - labels (list): List of {name, prefix, id}
+    """
+    try:
+        client = get_http_client()
+
+        response = await client.get(f"/rest/api/content/{params.page_id}/label")
+        response.raise_for_status()
+        data = response.json()
+
+        labels = [
+            {"name": lbl.get("name"), "prefix": lbl.get("prefix"), "id": lbl.get("id")}
+            for lbl in data.get("results", [])
+        ]
+
+        return json.dumps({
+            "success": True,
+            "page_id": params.page_id,
+            "count": len(labels),
+            "labels": labels
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"success": False, "error": _handle_api_error(e)}, indent=2)
+
+
+@mcp.tool(
+    name="confluence_add_label",
+    annotations={
+        "title": "Add Label to Page",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+async def add_label(params: AddLabelInput) -> str:
+    """Add a label to a Confluence page.
+
+    Adds a label with prefix 'global' (standard for DC). Adding a label that
+    already exists is idempotent — no error is returned.
+
+    Args:
+        params (AddLabelInput): Parameters containing:
+            - page_id (str): ID of the page
+            - name (str): Label name (lowercase, spaces as hyphens)
+
+    Returns:
+        str: JSON response containing:
+            - success (bool): Whether label was added
+            - page_id (str): Page ID
+            - labels (list): Updated list of all labels on the page
+    """
+    try:
+        client = get_http_client()
+
+        label_name = params.name.lower().replace(" ", "-")
+        payload = [{"prefix": "global", "name": label_name}]
+
+        response = await client.post(
+            f"/rest/api/content/{params.page_id}/label",
+            json=payload
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        labels = [
+            {"name": lbl.get("name"), "prefix": lbl.get("prefix"), "id": lbl.get("id")}
+            for lbl in data.get("results", [])
+        ]
+
+        return json.dumps({
+            "success": True,
+            "page_id": params.page_id,
+            "added_label": label_name,
+            "labels": labels,
+            "message": f"Label '{label_name}' added successfully"
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"success": False, "error": _handle_api_error(e)}, indent=2)
+
+
+@mcp.tool(
+    name="confluence_search_user",
+    annotations={
+        "title": "Search Confluence Users",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False
+    }
+)
+async def search_user(params: SearchUserInput) -> str:
+    """Search for Confluence users by name or within a group.
+
+    Searches users via CQL (type=user) or plain text. On Confluence DC,
+    CQL user search is limited — use group_name to search group members instead.
+
+    Args:
+        params (SearchUserInput): Parameters containing:
+            - query (str): Search query (plain text or CQL expression)
+            - group_name (Optional[str]): Search within a specific group (DC fallback)
+            - limit (int): Max results (default: 10)
+
+    Returns:
+        str: JSON response containing:
+            - count (int): Number of users found
+            - users (list): List of {username, display_name, email, user_key}
+    """
+    try:
+        client = get_http_client()
+        users = []
+
+        if params.group_name:
+            # DC: search group members
+            response = await client.get(
+                f"/rest/api/group/{params.group_name}/member",
+                params={"limit": params.limit}
+            )
+            response.raise_for_status()
+            data = response.json()
+            raw_users = data.get("results", [])
+
+            # Filter by query if provided
+            q = params.query.lower()
+            for u in raw_users:
+                display = u.get("displayName", "")
+                name = u.get("username", u.get("name", ""))
+                if q in display.lower() or q in name.lower():
+                    users.append({
+                        "username": name,
+                        "display_name": display,
+                        "email": u.get("email", ""),
+                        "user_key": u.get("userKey", u.get("accountId", ""))
+                    })
+        else:
+            # CQL user search
+            cql_keywords = ["type=", "user.fullname", "user.accountid", " AND ", " OR "]
+            is_cql = any(kw in params.query for kw in cql_keywords)
+            cql = params.query if is_cql else f'type=user AND user.fullname ~ "{params.query}"'
+
+            response = await client.get(
+                "/rest/api/search",
+                params={"cql": cql, "limit": params.limit}
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            for result in data.get("results", []):
+                u = result.get("user", result)
+                users.append({
+                    "username": u.get("username", u.get("name", "")),
+                    "display_name": u.get("displayName", ""),
+                    "email": u.get("email", ""),
+                    "user_key": u.get("userKey", u.get("accountId", ""))
+                })
+
+        return json.dumps({
+            "success": True,
+            "count": len(users),
+            "users": users
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"success": False, "error": _handle_api_error(e)}, indent=2)
 
 
 if __name__ == "__main__":
