@@ -35,7 +35,7 @@ except ImportError:
 from typing import Optional, List, Literal
 from enum import Enum
 from pydantic import BaseModel, Field, field_validator, ConfigDict
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 # Initialize MCP server
 mcp = FastMCP("confluence_creator_mcp_extended")
@@ -1292,32 +1292,102 @@ async def remove_restrictions(params: RemoveRestrictionInput) -> str:
         elif params.operation:
             operations_to_remove = [params.operation.value]
 
-        # Remove restrictions for each operation
+        # Remove restrictions using the legacy Confluence action endpoint.
+        # This Confluence instance's REST v1 DELETE endpoints for
+        # /restriction/byOperation/{op}/user and /group/{name} return 404 - they
+        # don't work on this instance/version. The endpoint that DOES work
+        # (confirmed via confluence_add_restrictions) is the legacy
+        # setcontentpermissions.action, which SETS the entire permission state
+        # for the page in one call (not additive). So to remove restrictions we
+        # fetch the current state for read+update, blank out only the
+        # operation(s) being removed, and resubmit the rest unchanged.
         removed_operations = []
         errors = []
+        debug_log = []
 
-        for operation in operations_to_remove:
-            try:
-                # Use REST API to delete restrictions
-                response = await client.delete(
-                    f"/rest/api/content/{page_id}/restriction/byOperation/{operation}"
+        try:
+            current = {}
+            for op in ["read", "update"]:
+                op_resp = await client.get(
+                    f"/rest/api/content/{page_id}/restriction/byOperation/{op}",
+                    params={"expand": "restrictions.user,restrictions.group"}
                 )
-
-                # Accept both 204 (No Content - success) and 404 (Not Found - no restrictions to remove)
-                if response.status_code in [204, 404]:
-                    removed_operations.append(operation)
+                if op_resp.status_code == 200:
+                    op_data = op_resp.json()
+                    current[op] = {
+                        "users": op_data.get("restrictions", {}).get("user", {}).get("results", []),
+                        "groups": op_data.get("restrictions", {}).get("group", {}).get("results", [])
+                    }
                 else:
-                    response.raise_for_status()
-                    removed_operations.append(operation)
+                    current[op] = {"users": [], "groups": []}
 
-            except httpx.HTTPStatusError as e:
-                # If 404, it means there were no restrictions - that's okay
-                if e.response.status_code == 404:
-                    removed_operations.append(operation)
-                else:
-                    errors.append(f"Failed to remove {operation} restrictions: {_handle_api_error(e)}")
-            except Exception as e:
-                errors.append(f"Failed to remove {operation} restrictions: {_handle_api_error(e)}")
+            def user_key(u):
+                return u.get("userKey") or u.get("key") or u.get("username") or u.get("name")
+
+            # Build final desired state: keep existing entries for operations
+            # NOT being removed, blank out the ones being removed.
+            final_read_users = [] if "read" in operations_to_remove else current["read"]["users"]
+            final_read_groups = [] if "read" in operations_to_remove else current["read"]["groups"]
+            final_update_users = [] if "update" in operations_to_remove else current["update"]["users"]
+            final_update_groups = [] if "update" in operations_to_remove else current["update"]["groups"]
+
+            form_data = []
+            for u in final_read_users:
+                k = user_key(u)
+                if k:
+                    form_data.append(f"viewPermissionsUserList={k}")
+            for g in final_read_groups:
+                if g.get("name"):
+                    form_data.append(f"viewPermissionsGroupList={g['name']}")
+            for u in final_update_users:
+                k = user_key(u)
+                if k:
+                    form_data.append(f"editPermissionsUserList={k}")
+            for g in final_update_groups:
+                if g.get("name"):
+                    form_data.append(f"editPermissionsGroupList={g['name']}")
+
+            form_data.append(f"contentId={page_id}")
+            form_body = "&".join(form_data)
+
+            resp = await client.post(
+                "/pages/setcontentpermissions.action",
+                content=form_body,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "X-Atlassian-Token": "no-check"
+                }
+            )
+            debug_log.append(f"POST setcontentpermissions.action -> status={resp.status_code} body={resp.text[:300]}")
+            resp.raise_for_status()
+
+            if "true" not in resp.text.lower():
+                errors.append(f"API returned unexpected response: {resp.text[:200]}")
+
+            # Verify
+            for op in operations_to_remove:
+                verify_resp = await client.get(
+                    f"/rest/api/content/{page_id}/restriction/byOperation/{op}",
+                    params={"expand": "restrictions.user,restrictions.group"}
+                )
+                op_ok = False
+                if verify_resp.status_code == 404:
+                    op_ok = True
+                elif verify_resp.status_code == 200:
+                    verify_data = verify_resp.json()
+                    remaining_users = verify_data.get("restrictions", {}).get("user", {}).get("results", [])
+                    remaining_groups = verify_data.get("restrictions", {}).get("group", {}).get("results", [])
+                    if not remaining_users and not remaining_groups:
+                        op_ok = True
+                    else:
+                        errors.append(
+                            f"Verification failed: {op} still has {len(remaining_users)} user(s) and {len(remaining_groups)} group(s) restricted after removal attempt"
+                        )
+                if op_ok:
+                    removed_operations.append(op)
+
+        except Exception as e:
+            errors.append(f"Failed to remove restrictions: {_handle_api_error(e)}")
 
         result = {
             "success": len(removed_operations) > 0,
@@ -1328,6 +1398,9 @@ async def remove_restrictions(params: RemoveRestrictionInput) -> str:
 
         if errors:
             result["warnings"] = errors
+
+        if debug_log:
+            result["debug_log"] = debug_log
 
         if removed_operations:
             result["message"] = f"Removed restrictions for: {', '.join(removed_operations)}"
