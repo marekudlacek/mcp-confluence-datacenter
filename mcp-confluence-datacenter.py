@@ -13,12 +13,17 @@ It provides tools for:
 Requirements:
 - CONFLUENCE_URL: Your Confluence DC URL (e.g., https://confluence.your-domain.com)
 - CONFLUENCE_LOGIN: Your Confluence username
-- CONFLUENCE_API_TOKEN: Your Confluence personal access token
+- Store your Confluence API token in the OS keychain with --store-credentials api-token
 """
 
+import argparse
 import os
 import json
 import re
+import sys
+import getpass
+import keyring
+import keyring.errors
 import httpx
 try:
     import html2text as _html2text_module
@@ -43,25 +48,91 @@ mcp = FastMCP("confluence_creator_mcp_extended")
 # Configuration
 CONFLUENCE_URL = os.getenv("CONFLUENCE_URL", "").rstrip("/")
 CONFLUENCE_LOGIN = os.getenv("CONFLUENCE_LOGIN", "")
-CONFLUENCE_API_TOKEN = os.getenv("CONFLUENCE_API_TOKEN", "")
+CONFLUENCE_API_TOKEN = ""
+CONFLUENCE_CREDENTIAL_SERVICE = os.getenv(
+    "CONFLUENCE_CREDENTIAL_SERVICE", "confluence-mcp"
+)
 
 # Sync configuration (for user directory sync - requires admin credentials)
-CONFLUENCE_LOGIN_PASSWORD = os.getenv("CONFLUENCE_LOGIN_PASSWORD", "")
+CONFLUENCE_SYNC_LOGIN = os.getenv("CONFLUENCE_SYNC_LOGIN", CONFLUENCE_LOGIN)
+CONFLUENCE_SYNC_CREDENTIAL_SERVICE = os.getenv(
+    "CONFLUENCE_SYNC_CREDENTIAL_SERVICE", "confluence-mcp-sync"
+)
 CONFLUENCE_DIRECTORY_ID = os.getenv("CONFLUENCE_DIRECTORY_ID", "")
 
 # Singleton HTTP client
 _http_client: Optional[httpx.AsyncClient] = None
 
 
+def _get_keychain_secret(service: str, login: str, credential_type: str) -> str:
+    """Load a credential from the operating system keychain."""
+    if not login:
+        raise ValueError(f"Missing Confluence login for the {credential_type}.")
+
+    try:
+        secret = keyring.get_password(service, login)
+    except keyring.errors.KeyringError as error:
+        raise RuntimeError(
+            f"Unable to access the OS keychain service '{service}'."
+        ) from error
+
+    if not secret:
+        raise ValueError(
+            f"No {credential_type} found in the OS keychain for account '{login}'. "
+            f"Run this server with --store-credentials {credential_type} to save it."
+        )
+    return secret
+
+
+def store_credentials_cli(credential_type: str) -> None:
+    """Securely prompt for and store a Confluence credential in the OS keychain."""
+    if credential_type == "api-token":
+        login = CONFLUENCE_LOGIN or input("Confluence username: ").strip()
+        service = CONFLUENCE_CREDENTIAL_SERVICE
+        prompt = "Confluence API token: "
+    else:
+        login = CONFLUENCE_SYNC_LOGIN or input("Confluence sync admin username: ").strip()
+        service = CONFLUENCE_SYNC_CREDENTIAL_SERVICE
+        prompt = "Confluence sync admin password: "
+
+    if not login:
+        sys.stderr.write("A Confluence login is required to store credentials.\n")
+        raise SystemExit(1)
+
+    if not sys.stdin.isatty():
+        sys.stderr.write("Credential storage must be run from an interactive terminal.\n")
+        raise SystemExit(1)
+
+    secret = getpass.getpass(prompt)
+    if not secret:
+        sys.stderr.write("A non-empty credential is required.\n")
+        raise SystemExit(1)
+
+    try:
+        keyring.set_password(service, login, secret)
+    except keyring.errors.KeyringError as error:
+        sys.stderr.write(f"Failed to store Confluence credentials: {error}\n")
+        raise SystemExit(1) from error
+
+    print(
+        f"Stored {credential_type} in the OS keychain "
+        f"(service='{service}', account='{login}')."
+    )
+
+
 def get_http_client() -> httpx.AsyncClient: 
     """Get or create singleton HTTP client for Confluence API."""
-    global _http_client
+    global _http_client, CONFLUENCE_API_TOKEN
     if _http_client is None:
-        if not all([CONFLUENCE_URL, CONFLUENCE_API_TOKEN]):
+        if not CONFLUENCE_URL:
             raise ValueError(
-                "Missing required environment variables: "
-                "CONFLUENCE_URL, CONFLUENCE_API_TOKEN"
+                "Missing required environment variable: CONFLUENCE_URL"
             )
+        CONFLUENCE_API_TOKEN = _get_keychain_secret(
+            CONFLUENCE_CREDENTIAL_SERVICE,
+            CONFLUENCE_LOGIN,
+            "api-token",
+        )
         _http_client = httpx.AsyncClient(
             base_url=CONFLUENCE_URL,
             headers={
@@ -415,11 +486,7 @@ class SyncUserDirectoryInput(BaseModel):
     )
     login: Optional[str] = Field(
         default=None,
-        description="Admin login for Confluence. If not provided, uses CONFLUENCE_LOGIN env variable."
-    )
-    password: Optional[str] = Field(
-        default=None,
-        description="Admin password for Confluence. If not provided, uses CONFLUENCE_LOGIN_PASSWORD env variable."
+        description="Admin login for Confluence. If not provided, uses CONFLUENCE_SYNC_LOGIN or CONFLUENCE_LOGIN."
     )
 
 
@@ -1741,8 +1808,7 @@ async def sync_user_directory(params: SyncUserDirectoryInput) -> str:
     Args:
         params (SyncUserDirectoryInput): Sync parameters containing:
             - directory_id (Optional[str]): Directory ID to sync (default from env)
-            - login (Optional[str]): Admin login (default from env)
-            - password (Optional[str]): Admin password (default from env)
+            - login (Optional[str]): Admin login (default from env); the credential is read from the OS keychain
 
     Returns:
         str: JSON response containing:
@@ -1751,15 +1817,19 @@ async def sync_user_directory(params: SyncUserDirectoryInput) -> str:
             - directory_id (str): ID of the synced directory
     """
     try:
-        # Get credentials from params or environment
-        login = params.login or CONFLUENCE_LOGIN
-        password = params.password or CONFLUENCE_LOGIN_PASSWORD
+        # Keep credentials out of MCP parameters and environment variables.
+        login = params.login or CONFLUENCE_SYNC_LOGIN
+        password = _get_keychain_secret(
+            CONFLUENCE_SYNC_CREDENTIAL_SERVICE,
+            login,
+            "sync-password",
+        ) if login else ""
         directory_id = params.directory_id or CONFLUENCE_DIRECTORY_ID
 
-        if not login or not password:
+        if not login:
             return json.dumps({
                 "success": False,
-                "error": "Missing credentials. Set CONFLUENCE_LOGIN and CONFLUENCE_LOGIN_PASSWORD environment variables or provide them as parameters."
+                "error": "Missing admin login. Set CONFLUENCE_SYNC_LOGIN or CONFLUENCE_LOGIN, or provide login as a parameter."
             }, indent=2)
 
         if not directory_id:
@@ -2517,5 +2587,16 @@ async def search_user(params: SearchUserInput) -> str:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        parser = argparse.ArgumentParser()
+        parser.add_argument(
+            "--store-credentials",
+            choices=("api-token", "sync-password"),
+            required=True,
+        )
+        args = parser.parse_args()
+        store_credentials_cli(args.store_credentials)
+        raise SystemExit(0)
+
     # Run the MCP server
     mcp.run()
