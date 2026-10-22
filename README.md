@@ -108,7 +108,7 @@ Once configured, you can use natural language commands with Claude:
 - Python 3.10+
 - Claude
 - Confluence Data Center or Server instance
-- API user token or user credentials
+- Confluence API token; for optional directory sync, an admin credential. Secrets are stored in the OS keychain.
 
 ## Installing uv (Recommended)
 
@@ -168,9 +168,19 @@ Set the following environment variables:
 |----------|----------|-------------|
 | `CONFLUENCE_URL` | Yes | Your Confluence URL (e.g., `https://confluence.company.com`) |
 | `CONFLUENCE_LOGIN` | Yes | Your Confluence username |
-| `CONFLUENCE_API_TOKEN` | Yes | Your Confluence API token or password |
-| `CONFLUENCE_LOGIN_PASSWORD` | For sync | Admin password (required for user directory sync) |
+| `CONFLUENCE_CREDENTIAL_SERVICE` | No | OS keychain service for the API token. Default: `confluence-mcp`. |
+| `CONFLUENCE_SYNC_LOGIN` | For sync | Admin username; defaults to `CONFLUENCE_LOGIN`. |
+| `CONFLUENCE_SYNC_CREDENTIAL_SERVICE` | No | OS keychain service for the sync credential. Default: `confluence-mcp-sync`. |
 | `CONFLUENCE_DIRECTORY_ID` | For sync | Directory ID for user directory sync |
+
+Store credentials in the OS keychain before starting the server. Each prompt hides the input:
+
+```bash
+python mcp-confluence-datacenter.py --store-credentials api-token
+python mcp-confluence-datacenter.py --store-credentials sync-password
+```
+
+Set `CONFLUENCE_LOGIN` in the environment before storing the API token. For a separate directory-sync administrator, set `CONFLUENCE_SYNC_LOGIN` before storing the sync credential. Both entries are indexed in the OS keychain by their service name and login. With `uv`, add `--with keyring` to the run command.
 
 ## Setup for Claude Code
 
@@ -185,8 +195,6 @@ Add to your `~/.claude.json` or project's `.claude.json`:
       "env": {
         "CONFLUENCE_URL": "https://confluence.your-company.com",
         "CONFLUENCE_LOGIN": "your-username",
-        "CONFLUENCE_API_TOKEN": "your-api-token",
-        "CONFLUENCE_LOGIN_PASSWORD": "your-password",
         "CONFLUENCE_DIRECTORY_ID": "your-directory-id"
       }
     }
@@ -206,6 +214,7 @@ Or with `uv` (recommended):
         "--with", "httpx",
         "--with", "pydantic",
         "--with", "mcp",
+        "--with", "keyring",
         "--with", "html2text",
         "--with", "markdown",
         "python",
@@ -214,8 +223,6 @@ Or with `uv` (recommended):
       "env": {
         "CONFLUENCE_URL": "https://confluence.your-company.com",
         "CONFLUENCE_LOGIN": "your-username",
-        "CONFLUENCE_API_TOKEN": "your-api-token",
-        "CONFLUENCE_LOGIN_PASSWORD": "your-password",
         "CONFLUENCE_DIRECTORY_ID": "your-directory-id"
       }
     }
@@ -235,10 +242,8 @@ You can add this MCP server directly using the `claude mcp add` command.
 claude mcp add --transport stdio confluence \
   --env CONFLUENCE_URL=https://confluence.your-company.com \
   --env CONFLUENCE_LOGIN=your-username \
-  --env CONFLUENCE_API_TOKEN=your-api-token \
-  --env CONFLUENCE_LOGIN_PASSWORD=your-password \
   --env CONFLUENCE_DIRECTORY_ID=your-directory-id \
-  -- uv run --with httpx --with pydantic --with mcp --with html2text --with markdown python /path/to/mcp-confluence-datacenter.py
+  -- uv run --with httpx --with pydantic --with mcp --with keyring --with html2text --with markdown python /path/to/mcp-confluence-datacenter.py
 ```
 
 ### With python:
@@ -247,8 +252,6 @@ claude mcp add --transport stdio confluence \
 claude mcp add --transport stdio confluence \
   --env CONFLUENCE_URL=https://confluence.your-company.com \
   --env CONFLUENCE_LOGIN=your-username \
-  --env CONFLUENCE_API_TOKEN=your-api-token \
-  --env CONFLUENCE_LOGIN_PASSWORD=your-password \
   --env CONFLUENCE_DIRECTORY_ID=your-directory-id \
   -- python /path/to/mcp-confluence-datacenter.py
 ```
@@ -283,8 +286,6 @@ Add to your Claude Desktop configuration file:
       "env": {
         "CONFLUENCE_URL": "https://confluence.your-company.com",
         "CONFLUENCE_LOGIN": "your-username",
-        "CONFLUENCE_API_TOKEN": "your-api-token",
-        "CONFLUENCE_LOGIN_PASSWORD": "your-password",
         "CONFLUENCE_DIRECTORY_ID": "your-directory-id"
       }
     }
@@ -304,6 +305,7 @@ Or with `uv` (recommended):
         "--with", "httpx",
         "--with", "pydantic",
         "--with", "mcp",
+        "--with", "keyring",
         "--with", "html2text",
         "--with", "markdown",
         "python",
@@ -312,8 +314,6 @@ Or with `uv` (recommended):
       "env": {
         "CONFLUENCE_URL": "https://confluence.your-company.com",
         "CONFLUENCE_LOGIN": "your-username",
-        "CONFLUENCE_API_TOKEN": "your-api-token",
-        "CONFLUENCE_LOGIN_PASSWORD": "your-password",
         "CONFLUENCE_DIRECTORY_ID": "your-directory-id"
       }
     }
