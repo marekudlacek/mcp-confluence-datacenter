@@ -20,6 +20,7 @@ import argparse
 import os
 import json
 import re
+import mimetypes
 import sys
 import getpass
 import keyring
@@ -41,6 +42,11 @@ from typing import Optional, List, Literal
 from enum import Enum
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 from fastmcp import FastMCP
+
+# MCP stdio may use the Windows ANSI code page rather than UTF-8.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 # Initialize MCP server
 mcp = FastMCP("confluence_creator_mcp_extended")
@@ -585,6 +591,37 @@ class SearchUserInput(BaseModel):
     limit: int = Field(default=10, description="Maximum number of results to return", ge=1, le=50)
 
 
+class UploadAttachmentInput(BaseModel):
+    """Input for uploading a file as an attachment to a Confluence page."""
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra='forbid')
+
+    page_id: Optional[str] = Field(default=None, description="ID of the page to attach the file to", min_length=1)
+    page_title: Optional[str] = Field(default=None, description="Title of the page (alternative to page_id)", min_length=1)
+    space_key: Optional[str] = Field(default=None, description="Space key (required when using page_title)", min_length=1)
+    file_path: str = Field(..., description="Absolute local filesystem path to the file to upload", min_length=1)
+    comment: Optional[str] = Field(default=None, description="Optional comment/description for the attachment version")
+    minor_edit: bool = Field(default=False, description="Whether to mark this as a minor edit (skips notifications, default: False)")
+
+
+class GetAttachmentsInput(BaseModel):
+    """Input for listing attachments on a Confluence page."""
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra='forbid')
+
+    page_id: Optional[str] = Field(default=None, description="ID of the page to list attachments for", min_length=1)
+    page_title: Optional[str] = Field(default=None, description="Title of the page (alternative to page_id)", min_length=1)
+    space_key: Optional[str] = Field(default=None, description="Space key (required when using page_title)", min_length=1)
+    filename: Optional[str] = Field(default=None, description="Optional filename filter to find a specific attachment", min_length=1)
+    limit: int = Field(default=25, description="Maximum number of results to return (default: 25, max: 100)", ge=1, le=100)
+    start: int = Field(default=0, description="Starting index for pagination (default: 0)", ge=0)
+
+
+class DeleteAttachmentInput(BaseModel):
+    """Input for deleting a Confluence attachment."""
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra='forbid')
+
+    attachment_id: str = Field(..., description="ID of the attachment to delete", min_length=1)
+
+
 async def _find_page_by_title(client: httpx.AsyncClient, space_key: str, title: str) -> Optional[str]:
     """Find page ID by title in a specific space.
 
@@ -676,6 +713,18 @@ def _html_to_markdown(html: str) -> str:
     """Convert HTML/storage content to Markdown."""
     if not html:
         return ""
+    html = re.sub(
+        r'<ac:structured-macro[^>]*ac:name="html"[^>]*>.*?<ac:plain-text-body><!\[CDATA\[(.*?)\]\]></ac:plain-text-body>.*?</ac:structured-macro>',
+        r'\1',
+        html,
+        flags=re.DOTALL,
+    )
+    html = re.sub(
+        r'<(style|script)\b[^>]*>.*?</\1>',
+        '',
+        html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
     if _HTML2TEXT_AVAILABLE:
         h = _html2text_module.HTML2Text()
         h.ignore_links = False
@@ -1095,10 +1144,14 @@ async def add_restrictions(params: AddRestrictionInput) -> str:
                 "error": "At least one user or group must be specified"
             }, indent=2)
 
-        # Check if page name contains "Private" or "Shared"
+        # These pages and groups require both view and edit restrictions.
         # These pages get "Viewing and editing restricted" (both view + edit)
         # Other pages get "Editing restricted" (only edit, everyone can view)
-        is_private_or_shared = "Private" in page_title or "Shared" in page_title
+        is_private_or_shared = (
+            "Private" in page_title
+            or "Shared" in page_title
+            or any("_viewandedit" in group.lower() for group in group_ids)
+        )
 
         # Use legacy Confluence API for setting permissions (works with on-premise)
         # This API uses form data instead of JSON
@@ -2497,6 +2550,199 @@ async def add_label(params: AddLabelInput) -> str:
             "message": f"Label '{label_name}' added successfully"
         }, indent=2)
 
+    except Exception as e:
+        return json.dumps({"success": False, "error": _handle_api_error(e)}, indent=2)
+
+
+async def _resolve_attachment_page_id(
+    client: httpx.AsyncClient,
+    page_id: Optional[str],
+    page_title: Optional[str],
+    space_key: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    if page_id and page_title:
+        return None, json.dumps({"success": False, "error": "Cannot specify both page_id and page_title."}, indent=2)
+    if not page_id and not page_title:
+        return None, json.dumps({"success": False, "error": "Must specify either page_id or page_title."}, indent=2)
+    if page_title:
+        if not space_key:
+            return None, json.dumps({"success": False, "error": "space_key is required when using page_title."}, indent=2)
+        resolved_id = await _find_page_by_title(client, space_key, page_title)
+        if not resolved_id:
+            return None, json.dumps({
+                "success": False,
+                "error": f"Page '{page_title}' not found in space '{space_key}'.",
+            }, indent=2)
+        return resolved_id, None
+    return page_id, None
+
+
+@mcp.tool(
+    name="confluence_upload_attachment",
+    annotations={
+        "title": "Upload Page Attachment",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def upload_attachment(params: UploadAttachmentInput) -> str:
+    """Upload a local file to a page, creating a new version for matching filenames."""
+    try:
+        client = get_http_client()
+        page_id, error = await _resolve_attachment_page_id(
+            client, params.page_id, params.page_title, params.space_key
+        )
+        if error:
+            return error
+
+        if not os.path.isfile(params.file_path):
+            return json.dumps({
+                "success": False,
+                "error": f"File not found or not a regular file: {params.file_path}",
+            }, indent=2)
+
+        filename = os.path.basename(params.file_path)
+        file_size = os.path.getsize(params.file_path)
+        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+        check_response = await client.get(
+            f"/rest/api/content/{page_id}/child/attachment",
+            params={"filename": filename},
+        )
+        check_response.raise_for_status()
+        existing = check_response.json().get("results", [])
+        existing_attachment_id = existing[0]["id"] if existing else None
+
+        if existing_attachment_id:
+            url = f"/rest/api/content/{page_id}/child/attachment/{existing_attachment_id}/data"
+        else:
+            url = f"/rest/api/content/{page_id}/child/attachment"
+
+        headers = httpx.Headers(client.headers)
+        headers.pop("content-type", None)
+        headers["X-Atlassian-Token"] = "no-check"
+        data = {}
+        if params.comment:
+            data["comment"] = params.comment
+        if params.minor_edit:
+            data["minorEdit"] = "true"
+
+        async with httpx.AsyncClient(
+            base_url=CONFLUENCE_URL,
+            headers=headers,
+            timeout=30.0,
+        ) as upload_client:
+            with open(params.file_path, "rb") as file:
+                response = await upload_client.post(
+                    url,
+                    files={"file": (filename, file, mime_type)},
+                    data=data,
+                )
+        response.raise_for_status()
+        result_data = response.json()
+        attachment = (
+            result_data.get("results", [result_data])[0]
+            if "results" in result_data
+            else result_data
+        )
+
+        return json.dumps({
+            "success": True,
+            "attachment_id": attachment.get("id"),
+            "filename": attachment.get("title", filename),
+            "size": attachment.get("extensions", {}).get("fileSize", file_size),
+            "download_url": attachment.get("_links", {}).get("download", ""),
+            "version": attachment.get("version", {}).get("number", 1),
+            "is_new_version": bool(existing_attachment_id),
+            "message": (
+                f"Attachment '{filename}' "
+                f"{'versioned' if existing_attachment_id else 'uploaded'} successfully"
+            ),
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": _handle_api_error(e)}, indent=2)
+
+
+@mcp.tool(
+    name="confluence_get_attachments",
+    annotations={
+        "title": "Get Page Attachments",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def get_attachments(params: GetAttachmentsInput) -> str:
+    """List page attachments with optional filename filtering and pagination."""
+    try:
+        client = get_http_client()
+        page_id, error = await _resolve_attachment_page_id(
+            client, params.page_id, params.page_title, params.space_key
+        )
+        if error:
+            return error
+
+        query_params = {
+            "limit": params.limit,
+            "start": params.start,
+            "expand": "version,extensions",
+        }
+        if params.filename:
+            query_params["filename"] = params.filename
+        response = await client.get(
+            f"/rest/api/content/{page_id}/child/attachment",
+            params=query_params,
+        )
+        response.raise_for_status()
+        attachments = []
+        for item in response.json().get("results", []):
+            extensions = item.get("extensions", {})
+            version = item.get("version", {})
+            attachments.append({
+                "id": item.get("id"),
+                "title": item.get("title"),
+                "media_type": extensions.get("mediaType", ""),
+                "file_size": extensions.get("fileSize", 0),
+                "download_url": item.get("_links", {}).get("download", ""),
+                "version": version.get("number", 1),
+                "when": version.get("when", ""),
+            })
+
+        return json.dumps({
+            "success": True,
+            "page_id": page_id,
+            "count": len(attachments),
+            "attachments": attachments,
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": _handle_api_error(e)}, indent=2)
+
+
+@mcp.tool(
+    name="confluence_delete_attachment",
+    annotations={
+        "title": "Delete Confluence Attachment",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def delete_attachment(params: DeleteAttachmentInput) -> str:
+    """Move an attachment to the Confluence trash."""
+    try:
+        client = get_http_client()
+        response = await client.delete(f"/rest/api/content/{params.attachment_id}")
+        if response.status_code not in (200, 204):
+            response.raise_for_status()
+        return json.dumps({
+            "success": True,
+            "attachment_id": params.attachment_id,
+            "message": "Attachment moved to trash.",
+        }, indent=2)
     except Exception as e:
         return json.dumps({"success": False, "error": _handle_api_error(e)}, indent=2)
 
