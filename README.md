@@ -15,6 +15,7 @@ MCP (Model Context Protocol) server for Confluence Data Center / Server. Enables
 - Get child pages of a parent page
 - **Read and post page comments** (with Markdown ↔ Confluence storage format conversion)
 - **Manage page labels** (read and add)
+- **Manage page attachments** (upload, list and delete; matching filenames upload as new versions)
 - **Search Confluence users** by name, by CQL or within a specific group
 - Sync user directory with external directory (e.g., Active Directory)
 
@@ -68,6 +69,15 @@ List all labels assigned to a page.
 ### `confluence_add_label`
 Add a label to a page (prefix `global`, standard for Confluence DC). The label name is normalized (lowercased, spaces → hyphens). Idempotent — adding an existing label is a no-op.
 
+### `confluence_upload_attachment`
+Upload a local file to a page by `page_id` or `page_title` + `space_key`. Re-uploading a file with the same name creates a new attachment version. Optional `comment` and `minor_edit` values are supported.
+
+### `confluence_get_attachments`
+List attachments on a page, optionally filtered by `filename`. Supports `limit` and `start` pagination.
+
+### `confluence_delete_attachment`
+Move an attachment to the Confluence trash by its `attachment_id`.
+
 ### `confluence_search_user`
 Search Confluence users by name, by CQL expression, or list members of a specific group (`group_name` fallback for Confluence DC, which has limited CQL user search). Returns `username`, `display_name`, `email` and `user_key`.
 
@@ -95,6 +105,10 @@ Once configured, you can use natural language commands with Claude:
 - "Show comments on page 12345"
 - "Add a comment 'Reviewed and approved ✅' to page 12345"
 - "Show labels on page 12345 and add label 'important'"
+- "Upload the file report.pdf to page 12345 as an attachment"
+- "Attach diagram.png to page titled 'Architecture Overview' in DOCS space"
+- "List attachments on page 12345"
+- "Delete attachment att67890"
 - "Find user Jan Novak"
 - "List members of group 'confluence-users' that match 'novak'"
 - "Sync the Confluence user directory"
@@ -213,7 +227,7 @@ Or with `uv` (recommended):
         "run",
         "--with", "httpx",
         "--with", "pydantic",
-        "--with", "mcp",
+        "--with", "fastmcp>=2.13.0",
         "--with", "keyring",
         "--with", "html2text",
         "--with", "markdown",
@@ -243,7 +257,7 @@ claude mcp add --transport stdio confluence \
   --env CONFLUENCE_URL=https://confluence.your-company.com \
   --env CONFLUENCE_LOGIN=your-username \
   --env CONFLUENCE_DIRECTORY_ID=your-directory-id \
-  -- uv run --with httpx --with pydantic --with mcp --with keyring --with html2text --with markdown python /path/to/mcp-confluence-datacenter.py
+  -- uv run --with httpx --with pydantic --with "fastmcp>=2.13.0" --with keyring --with html2text --with markdown python /path/to/mcp-confluence-datacenter.py
 ```
 
 ### With python:
@@ -304,7 +318,7 @@ Or with `uv` (recommended):
         "run",
         "--with", "httpx",
         "--with", "pydantic",
-        "--with", "mcp",
+        "--with", "fastmcp>=2.13.0",
         "--with", "keyring",
         "--with", "html2text",
         "--with", "markdown",
